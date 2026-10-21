@@ -1,1 +1,1 @@
-clang++: error: no such file or directory: '/utf-8'
+D:/a/YimMenuV2/YimMenuV2/src/game/hooks/Info/NetworkPlayerManager.cpp:7:13: error: out-of-line definition of 'NetworkPlayerMgrInit' does not match any declaration in namespace 'YimMenu::Hooks::Info'
