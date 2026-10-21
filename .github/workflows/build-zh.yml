@@ -1,0 +1,65 @@
+# 汉化版构建工作流
+# 用法：把本仓库推到 GitHub，Actions 会自动编译出 YimMenuV2.dll
+# 如果源码是以 src.zip 形式上传的，会自动解压；直接上传 src/ 目录也可以
+
+name: Build ZH
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    name: Build (Windows / clang-cl)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解压汉化源码（若存在 src.zip）
+        shell: pwsh
+        run: |
+          if (Test-Path src.zip) {
+            Expand-Archive -Path src.zip -DestinationPath _tmp -Force
+            if (Test-Path _tmp/YimMenuV2-nightly) {
+              Copy-Item _tmp/YimMenuV2-nightly/* . -Recurse -Force
+            } else {
+              Copy-Item _tmp/* . -Recurse -Force
+            }
+            Write-Host "源码已解压"
+          } else {
+            Write-Host "未发现 src.zip，直接使用仓库内源码"
+          }
+
+      - name: 检查源码结构
+        shell: pwsh
+        run: |
+          if (-Not (Test-Path src/common.hpp)) { throw "未找到 src/common.hpp，源码目录结构不正确" }
+          if (-Not (Test-Path CMakeLists.txt)) { throw "未找到 CMakeLists.txt" }
+          Write-Host "源码结构 OK"
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: 配置 CMake
+        run: cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo -S . -B build -G Ninja
+
+      - name: 编译 DLL
+        run: cmake --build ./build --config RelWithDebInfo --target YimMenuV2
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          if (-Not (Test-Path build/YimMenuV2.dll)) { throw "编译失败：未生成 YimMenuV2.dll" }
+          Get-Item build/YimMenuV2.dll | Format-List Name,Length,LastWriteTime
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: YimMenuV2-zh
+          path: |
+            build/YimMenuV2.dll
+            build/YimMenuV2.pdb
+          if-no-files-found: error
