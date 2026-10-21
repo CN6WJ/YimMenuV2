@@ -1,12 +1,13 @@
 # 汉化版构建工作流
-# 用法：把本仓库推到 GitHub，Actions 会自动编译出 YimMenuV2.dll
-# 如果源码是以 src.zip 形式上传的，会自动解压；直接上传 src/ 目录也可以
-
+# 特性：自动解压 zip / 修正跨时区时间戳 / 校验汉化 / 禁止 ninja 重生成 / 失败时把报错写回仓库
 name: Build ZH
 
 on:
   push:
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -16,27 +17,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 解压汉化源码（若存在 src.zip）
+      - name: 定位并解压汉化源码
         shell: pwsh
         run: |
-          if (Test-Path src.zip) {
-            Expand-Archive -Path src.zip -DestinationPath _tmp -Force
-            if (Test-Path _tmp/YimMenuV2-nightly) {
-              Copy-Item _tmp/YimMenuV2-nightly/* . -Recurse -Force
+          $zips = @(Get-ChildItem -Path . -Filter *.zip -File -Recurse -Depth 2 -ErrorAction SilentlyContinue)
+          if ($zips.Count -eq 0) { Write-Host "未发现 zip，使用仓库内已有源码" }
+          foreach ($z in $zips) {
+            Write-Host "发现压缩包：$($z.FullName)（$([math]::Round($z.Length/1MB,2)) MB）"
+            $tmp = Join-Path $env:RUNNER_TEMP ("unzip_" + [guid]::NewGuid().ToString("N"))
+            Expand-Archive -Path $z.FullName -DestinationPath $tmp -Force
+            $roots = @(Get-ChildItem $tmp)
+            if ($roots.Count -eq 1 -and $roots[0].PSIsContainer -and (Test-Path (Join-Path $roots[0].FullName "src"))) {
+              Copy-Item (Join-Path $roots[0].FullName "*") . -Recurse -Force
             } else {
-              Copy-Item _tmp/* . -Recurse -Force
+              Copy-Item (Join-Path $tmp "*") . -Recurse -Force
             }
-            Write-Host "源码已解压"
-          } else {
-            Write-Host "未发现 src.zip，直接使用仓库内源码"
           }
 
-      - name: 检查源码结构
+      - name: 修正文件时间戳
         shell: pwsh
         run: |
-          if (-Not (Test-Path src/common.hpp)) { throw "未找到 src/common.hpp，源码目录结构不正确" }
-          if (-Not (Test-Path CMakeLists.txt)) { throw "未找到 CMakeLists.txt" }
-          Write-Host "源码结构 OK"
+          # ZIP 内保存的是打包机本地时间且无时区，跨时区解压会变成“未来时间”
+          # 这会导致 ninja 反复重新生成 build.ninja，报 "still dirty after 100 tries"
+          $stamp = (Get-Date).AddMinutes(-10)
+          Get-ChildItem -Path . -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\\.git\\' -and $_.Extension -ne ".zip" } |
+            ForEach-Object { $_.LastWriteTime = $stamp }
+          Write-Host "已统一文件时间戳为 $stamp"
+
+      - name: 校验汉化是否生效
+        shell: pwsh
+        run: |
+          if (-Not (Test-Path "CMakeLists.txt")) { throw "找不到 CMakeLists.txt" }
+          if (-Not (Test-Path "src/common.hpp")) { throw "找不到 src/common.hpp" }
+          $probe = "src/game/frontend/submenus/Self.cpp"
+          $hit = Select-String -Path $probe -Pattern "自身" -SimpleMatch
+          if (-Not $hit) { throw "未检测到中文，汉化源码未覆盖成功" }
+          Write-Host "汉化校验通过：$($hit.Line.Trim())"
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -44,18 +61,62 @@ jobs:
           arch: amd64
 
       - name: 配置 CMake
-        run: cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo -S . -B build -G Ninja
+        shell: pwsh
+        run: |
+          cmake -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_SUPPRESS_REGENERATION=ON -S . -B build -G Ninja *>&1 | Tee-Object -FilePath configure.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: 编译 DLL
-        run: cmake --build ./build --config RelWithDebInfo --target YimMenuV2
+        shell: pwsh
+        run: |
+          cmake --build ./build --config RelWithDebInfo --target YimMenuV2 *>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: 编译失败时导出报错
+        if: failure()
+        shell: pwsh
+        run: |
+          $lines = @()
+          foreach ($f in @("build.log", "configure.log")) {
+            if (Test-Path $f) {
+              $hits = Select-String -Path $f -Pattern "error:|fatal error" | Select-Object -First 40
+              foreach ($h in $hits) { $lines += $h.Line.Trim() }
+            }
+          }
+          if ($lines.Count -eq 0 -and (Test-Path build.log)) { $lines = @(Get-Content build.log -Tail 80) }
+          $text = ($lines | Select-Object -Unique) -join "`n"
+          if (-Not $text) { $text = "(未采集到错误行，请查看完整日志)" }
+          Set-Content -Path build-error.txt -Value $text -Encoding utf8
+          Write-Host "===== 报错摘要 ====="
+          Write-Host $text
+          @"
+          ### 编译错误
+          ````
+          $text
+          ````
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: 将报错提交回仓库
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path build-error.txt) {
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add build-error.txt
+            git commit -m "ci: 记录编译错误 [skip ci]"
+            git push
+          }
 
       - name: 校验产物
+        if: success()
         shell: pwsh
         run: |
           if (-Not (Test-Path build/YimMenuV2.dll)) { throw "编译失败：未生成 YimMenuV2.dll" }
           Get-Item build/YimMenuV2.dll | Format-List Name,Length,LastWriteTime
 
       - name: 上传产物
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: YimMenuV2-zh
